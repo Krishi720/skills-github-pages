@@ -1,0 +1,271 @@
+# LRC Text Differentiator — Proof of Concept
+# -------------------------------------------------
+# This script provides a runnable proof-of-concept for differentiating
+# human vs. AI-generated text using Long-Range Correlations (LRC):
+# it computes Hurst/DFA exponents from multiple encodings of text.
+#
+# Encodings implemented (choose all by default):
+#   1) Binary presence of a target word (default: "the")
+#   2) Sentence-length series (words per sentence)
+#   3) Function-word indicator series (common English function words)
+#   4) Character-level vowel indicator series (vowel=1, consonant=0)
+#   5) Semantic drift (human texts generally produce smoother semantic patterns compared to GPT)
+#
+# For each encoding, we compute a scaling exponent:
+#   - If series length >= MIN_RS_POINTS (default 500), use Hurst RS (nolds.hurst_rs)
+#   - Otherwise, fall back to DFA alpha (nolds.dfa)
+#
+# A simple scoring function aggregates the exponents across encodings
+# and outputs a human-likeness score and a plain-English verdict.
+#
+# Usage examples:
+#   python lrc_poc.py                       # runs built-in test cases
+#   python lrc_poc.py --text1 file1.txt     # single text analysis
+#   python lrc_poc.py --text1 file1.txt --text2 file2.txt
+#   python lrc_poc.py --target the --min-rs 600
+#
+# Dependencies: numpy, nolds
+#   pip install numpy nolds
+
+import re
+import argparse
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import nolds
+
+# ---------------------- Config ----------------------
+MIN_RS_POINTS = 500  # minimum series length to use RS Hurst; else DFA fallback
+TARGET_WORD_DEFAULT = "the"
+
+FUNCTION_WORDS = {
+    # common English function words (subset; extend as needed)
+    "a","an","the","and","or","but","if","then","else","for","nor","so","yet",
+    "of","in","on","at","by","to","from","with","without","about","as","into",
+    "is","am","are","was","were","be","been","being",
+    "do","does","did","doing","done",
+    "have","has","had","having",
+    "this","that","these","those","it","its","itself",
+    "he","him","his","she","her","hers","they","them","their","theirs","we","us","our","ours",
+    "you","your","yours","i","me","my","mine",
+    "not","no","yes","also","very","too","just",
+    "there","here","when","where","why","how",
+}
+
+VOWELS = set(list("aeiou"))
+
+# ------------------- Preprocessing ------------------
+
+def tokenize_words(text: str) -> List[str]:
+    return re.findall(r"\b[\w']+\b", text.lower())
+
+def split_sentences(text: str) -> List[str]:
+    # Simple heuristic sentence splitter
+    sents = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+    return [s for s in sents if s]
+
+# load once, globally
+_sem_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def series_semantic_drift(sentences: List[str]) -> np.ndarray:
+    if len(sentences) < 2:
+        return np.array([0.0])
+    embeddings = _sem_model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True)
+    sims = [cosine_similarity([embeddings[i]], [embeddings[i+1]])[0,0]
+            for i in range(len(embeddings)-1)]
+    drift = [1-s for s in sims]   # "semantic distance" = 1 - similarity
+    return np.array(drift, dtype=float)
+
+# ---------------------- Encoders --------------------
+
+def series_word_presence(words: List[str], target: str) -> np.ndarray:
+    return np.array([1 if w == target else 0 for w in words], dtype=float)
+
+def series_sentence_lengths(sentences: List[str]) -> np.ndarray:
+    lengths = [len(tokenize_words(s)) for s in sentences]
+    # filter empty sentences (rare with the splitter above)
+    lengths = [l for l in lengths if l > 0]
+    return np.array(lengths, dtype=float)
+
+def series_function_word_indicator(words: List[str]) -> np.ndarray:
+    return np.array([1 if w in FUNCTION_WORDS else 0 for w in words], dtype=float)
+
+def series_vowel_indicator_chars(text: str) -> np.ndarray:
+    chars = re.findall(r"[a-z]", text.lower())
+    return np.array([1 if c in VOWELS else 0 for c in chars], dtype=float)
+
+# ------------------ Hurst / DFA Safe ----------------
+
+def hurst_or_dfa(x: np.ndarray, min_rs_points: int = MIN_RS_POINTS) -> Tuple[float, str]:
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        x = x.ravel()
+    if len(x) == 0:
+        raise ValueError("Empty series for Hurst/DFA computation.")
+    # Normalize to zero mean to improve stability
+    if np.std(x) > 0:
+        x = (x - np.mean(x)) / np.std(x)
+    if len(x) >= min_rs_points:
+        try:
+            return float(nolds.hurst_rs(x)), "RS"
+        except Exception:
+            # fall back to DFA if RS fails numerically
+            return float(nolds.dfa(x)), "DFA(fallback)"
+    else:
+        return float(nolds.dfa(x)), "DFA"
+
+# --------------------- Aggregation ------------------
+
+@dataclass
+class LRCResult:
+    encoding_values: Dict[str, Tuple[float, str]]  # encoding -> (exponent, method)
+    aggregate_score: float  # mean of exponents
+    verdict: str
+
+def aggregate_verdict(exponents: List[float]) -> Tuple[float, str]:
+    agg = float(np.mean(exponents))
+    # Simple heuristic thresholds; you can tighten after benchmarking.
+    if agg >= 0.56:
+        verdict = "More human-like global memory (persistent)."
+    elif agg <= 0.50:
+        verdict = "More AI-like or weak global memory (anti-/a-persistent)."
+    else:
+        verdict = "Ambiguous / mixed global memory."
+    return agg, verdict
+
+# --------------------- Main API ---------------------
+
+def analyze_text(text: str, target_word: str = TARGET_WORD_DEFAULT, min_rs_points: int = MIN_RS_POINTS) -> LRCResult:
+    words = tokenize_words(text)
+    sentences = split_sentences(text)
+
+    encodings = {}
+    # 1) Target word presence
+    encodings["word_presence"] = hurst_or_dfa(series_word_presence(words, target_word), min_rs_points)
+    # 2) Sentence lengths
+    encodings["sentence_lengths"] = hurst_or_dfa(series_sentence_lengths(sentences), min_rs_points)
+    # 3) Function-word indicator
+    encodings["function_words"] = hurst_or_dfa(series_function_word_indicator(words), min_rs_points)
+    # 4) Vowel indicator (character-level)
+    encodings["vowel_indicator"] = hurst_or_dfa(series_vowel_indicator_chars(text), min_rs_points)
+     # 5) Semantic drift between adjacent sentences
+    encodings["semantic_drift"] = hurst_or_dfa(series_semantic_drift(sentences), min_rs_points)
+
+    agg, verdict = aggregate_verdict([v for v, _ in encodings.values()])
+    return LRCResult(encoding_values=encodings, aggregate_score=agg, verdict=verdict)
+
+def compare_texts(text1: str, text2: str, target_word: str = TARGET_WORD_DEFAULT, min_rs_points: int = MIN_RS_POINTS) -> None:
+    r1 = analyze_text(text1, target_word, min_rs_points)
+    r2 = analyze_text(text2, target_word, min_rs_points)
+
+    def fmt(res: LRCResult, label: str):
+        print(f"\n=== {label} ===")
+        for name, (val, method) in res.encoding_values.items():
+            print(f"{name:18s}: {val:.3f}  [{method}]")
+        print(f"Aggregate (mean): {res.aggregate_score:.3f}")
+        print(f"Verdict: {res.verdict}")
+
+    fmt(r1, "Text 1")
+    fmt(r2, "Text 2")
+
+    # Simple side-by-side guidance
+    print("\n--- Comparison Summary ---")
+    if r1.aggregate_score > r2.aggregate_score + 0.02:
+        print("Text 1 shows stronger long-range persistence (more human-like).")
+    elif r2.aggregate_score > r1.aggregate_score + 0.02:
+        print("Text 2 shows stronger long-range persistence (more human-like).")
+    else:
+        print("Both texts are similar in global memory; use local features for tie-break.")
+
+# --------------------- CLI / Tests ------------------
+
+HUMAN_TEXT = """
+Consider the circumstances that surrounded the publication of John McGahern's The Dark, for example. Published in 1965, the book was immediately banned by the Irish Censorship Board for its alleged pornographic elements and use of the word 'fuck' on its opening page.  McGahern was subsequently removed from his teaching post and suffered 'quite a social disgrace' as a result of these events.  Abraham Kaplan argues, '[pornography] serves to elicit not the imaginative contemplation of an expressive substance, but rather the release in fantasy of a compelling impulse.' In other words, pornographic tendencies do not belong to the metaphysics of the ideological, thematic, or indeed the moral concerns of the writer, but serves to act merely as 'a stimulus to an experience.'  That is, of course, if the writer is a moralist at all. In McGahern's case, the intent is unquestionable. The Dark contains numerous references to sexual acts: for example, Mahoney's acts of masturbation, sexual fantasies, and his sexual abuse by his own father and his cousin, Father Gerald. The vividity of their descriptions serves to reflect young Mahoney's experiences as a victim of sexual repression in a parochial, Catholic Irish society on all levels of his individualism, which contributes to his incredibly bleak perception of country life in Ireland. Form plays an important role here in conveying this sense of bleakness, particularly in terms of technique and language. Perhaps the most striking feature of McGahern's novel is its narratorial quality. Usually shifting between the second- and third-person, the narrator's voice shifts across various chapters of the novel in no discernible pattern. In employing such a technique, McGahern essentially creates a protagonist whose sense of identity mimics the uncertainty in this pattern of narratorial shifts. As Stanley van der Ziel suggests, this constant act of shifting allows young Mahoney to be able to discern his own identity and as a way of seeing himself in various influential episodes of his life. Whereas young Mahoney– who does not seem to have a first name and whose identity is instead relativised with the identity of his father, who is referred to by the same name– seems to have no individuality, McGahern, by allowing this shift in narration, provides him with a sense of control as to his fragmented personality and so allows him to explore himself by means of narration. Despite harnessing such control, the narration is markedly bleak and dark in tone, signifying that, despite his best attempts, young Mahoney's expression not only retains but is informed by the sense of hopelessness that he lives through. This sense of hopelessness is heightened through much of the story's sexually charged prose, which almost always restricts itself to the quality of crude escapism rather than an aesthetic sense of freedom. In chapter five, for example– one of the only three chapters in the book that feature the narrative voice in the first person– as young Mahoney engages in an act of masturbation looking at an advert. The narration seems to embody young Mahoney's sense of freedom by means of McGahern's acutely descriptive style:
+The eyes devour the tattered piece of newspaper […] Touch the black hair with the lips, salt of sweat same as my own, let them rove along the rises of the breast. Press the mouth on the black bursting lips, slip the tongue through her teeth. […]  She stirs to life, I have her excited, she too is crazy, get hands under her. […] The pulsing dies away, a last gentle fluttering, and I can lie quiet. […] Everything is dead as dirt. […] Five sins already today, filthiness spilling five times. 
+
+Young Mahoney's sense of freedom, though only fleeting, comes through in the way McGahern employs language, 'slip the tongue through her teeth […] get hands under her–' suggesting a sense of vividity and chaos, one which the protagonist is in control of by virtue of the narrative voice. This sense of freedom, the 'pulsing,' dies away and young Mahoney is now left with the idea of having committed a sin– words like 'dirt,' 'filthiness' accompanying his realisation as such– suggesting that not only is masturbation a way of temporary escape, but a very hopeless one at that for him. When the narrator begins to describe young Mahoney's sexual abuse by his own father, for example:
+The old horror as hands were put about him […] the sharp stubble grown since the morning […] the thread of the half-dried mucus coming away from the other lips in the kiss. 
+
+the preciseness and bluntness of the language– 'sharp,' 'half-dried–' mimics the acute sense of discomfort and oppressiveness he feels as he is subject to the abuse. This sense of discomfort is heightened by the sensually detailed and unappealing imagery of 'the sharp stubble […] the thread of the half-dried mucus.' More importantly, by narrating this passage in the third person, young Mahoney loses all control of himself– this realisation adding more of its oppressive weight on the reader as much as on the protagonist himself.
+A more significant instance of abuse is that by Father Gerald, particularly because of his clerical status in the narrative. Interestingly, the narration in this passage is in the second-person, not simply taking away from the protagonist his sense of control but also adopting a rather confrontational stance:
+you stiffened when his arm went about your shoulder […] [you] wanted to curse or wrench yourself free but you had to lie stiff as a board. 
+
+Paralysis seems to mark his predicament in the presence of Father Gerald, mirroring the Church's obtrusive presence in the lives of the Irish in the early-to-mid-twentieth century. His abuse of the protagonist also takes on an interrogative quality to which the protagonist reacts even more bitterly, considering it a form of torture far worse than a forced physical union between both. This torture– a line of questioning that can be considered a forced communion of sorts– encroaches on young Mahoney's aspirations in a world he helplessly views as devoid of meaning.  As Brian Liddy notes:
+the church achieved control over Irish sexual identity by sending out its priests […] one cannot ignore the severity of the nation's sexual repression– a repression that manifests itself most severely in The Dark. 
+
+McGahern's intent on the inclusion and especially the descriptions of the abuse of young Mahoney, apart from his own sexual fantasies, ultimately seeks to address the crisis of sexual identity of Ireland and the Catholic's Church involvement in it, synthesising a broader discussion around the traditional understanding of the Irish national identity. In light of this realisation, the moral claims of literary censorship seem to be an undoing of the very institution that ultimately encourages moral discussions and thereby a broader understanding of public morality. As John McGahern himself said of the ban:
+I actually think that censorship is a self-defeating thing. […] A book should be judged on whether it's entertaining or whether it's useful or whether it's well-written. I actually happen to think that if something is well written, it can't be but moral by definition. 
+
+Literary censorship does not, however, restrict itself to a court of law or a panel of censors. It can manifest itself outside of it simply as a means of avoiding judicial scrutiny and its consequences. It is perhaps of considerable merit in itself, then, that Oscar Wilde wrote and published The Picture of Dorian Gray in the immediate aftermath of the Regina v. Hicklin case. Referring to the aforementioned utilitarianist argument of ennobling and depraving, Wilde's book serves as the ultimate antithesis to such an institution of thought. Published first in the literary periodical Lippincott's Monthly Magazine in July 1890, the novel was subject to censorship from the beginning: Joseph Stoddart, the editor of the magazine, effectively deleted five hundred words from Wilde's original typescript so as to make the publication more suitable for his readership.  This was done without Wilde's approval; not that Stoddart required his approval because, at the time, the means of publication lay totally with the editor of the magazine.  It would seem to a great extent that Stoddart's anxieties were well informed as, despite his careful measures, the publication received a 'torrent of abuse' from critics in the British press for its dormant elements of homoeroticism and supposed immorality– or as one critic opined, 'writing stuff that were better unwritten.' Meanwhile, Britain's biggest bookseller, W.H. Smith & Sons, proceeded to effectively ban the July issues of the Lippincott's from being sold at their stores.  Such was the extent of the story's alleged immorality. For example, in a review of the story, one critic writing for The Daily Chronicle said:
+Mr. Wilde's book has no real use if it be not to inculcate the "moral" that when you feel yourself becoming too angelic you cannot do better than rush out and make a beast of yourself. There is not a single good and holy impulse of human nature […] that civilization, art and religion have developed throughout the ages as part of the barriers between Humanity and Animalism that is not held up to ridicule and contempt in "Dorian Gray." 
+
+The critic seems to confuse the moral proclivities of the story's characters with the story's ulterior moral quality, seeing Dorian Gray's journey of transformation as a source of provocation rather than a source of reflection. Insofar as Wilde focuses on the aesthetic quality of his narrative, he does not so much neglect the story's morality as subordinate it to its aesthetic features. However, it is true that Wilde thought morality unimportant in determining the value of a book, as he claims in the preface to the book: '[there] is no such thing as a moral or an immoral book. Books are well written, or badly written. That is all.' 
+While this may lead to a predominantly amoral reading of the book, Wilde ultimately does not intend any moral or amoral lesson to be forced on his readers. On the contrary, he encourages his readers to appreciate beauty and the aesthetic limits of human invention for its own sake, and reflect on what the element of beauty exactly means to them. Just as Dorian Gray attempts to come to grips with the nature of beauty before taking to the hypnotic words of Lord Henry and idolising hedonism, youth and beauty– thereby succumbing to his hedonistic impulses– so is the reader lured into Wilde's highly sensual, linguistic invention to try and make sense of its beauty. As Dominic Manganiello suggests, Wilde essentially poses a question in the book: how can something so aesthetically beautiful also cause the destruction of one's morality?  Wilde implicitly asks this question by means of his protagonist's immoral actions and, more significantly, his own portrait that corrupts as he leads the life of a hedonistic criminal. Significantly, it is both these elements that are emblematic of any direct moral sense to the story.
+His employment of any moral intent thus serves ultimately his aesthetic ambition. The distinction he makes between his sense of moralism– or rather his disinterestedness towards it– and traditional notions of moralism relies on his preoccupation with aesthetics: his sense of aestheticism suffuses his ethical concerns to such an extent that he believes aestheticism essentially subsumes any form of ethical concern an artist may possess.  On this note, John G. Peters argues that the book's 'stylistic aesthetics so overshadow the moral events that morality actually emphasises aesthetics.'  In view of this, Wilde's inclination to a lack of morality in his art calls into question his story's alleged immorality, as his focus is ultimately on the beauty of his creation. On this account, in response to the aforementioned review, he insists that:
+from an æsthetic point of view, it would be difficult to keep the moral in its proper secondary place […] I think the moral too apparent […] the real moral of the story […] is so far artistically and deliberately suppressed that it does not enunciate its law as a general principle, but realises itself purely in the lives of individuals, and so becomes simply a dramatic element in a work of art, and not the object of the work of art itself. 
+
+"""
+
+GPT_TEXT = """
+
+James Joyce's literary achievement represents one of the most profound negotiations between mythological consciousness and rational thought in twentieth-century literature. His works, particularly Ulysses, demonstrate a sophisticated engagement with both the ancient mythological traditions that shaped Western culture and the scientific rationalism that characterized modernism. This dual engagement places Joyce at the intersection of competing epistemologies, where the cyclical patterns of myth meet the linear progressions of reason, where the symbolic richness of mythology encounters the empirical demands of science, and where the intuitive grasp of mythic truth confronts the systematic requirements of logic. Through his innovative narrative techniques and his philosophical sophistication, Joyce creates a literary space where these seemingly opposed modes of understanding can coexist and illuminate each other, producing a vision of human experience that transcends the limitations of either approach taken in isolation.
+The tension between myth and reason in Joyce's work emerges from his deep engagement with the intellectual currents of his time. The early twentieth century witnessed a crisis of confidence in the purely rational worldview that had dominated European thought since the Enlightenment. The horrors of World War I, the unsettling discoveries of psychoanalysis, and the revolutionary developments in physics all contributed to a sense that reason alone could not adequately account for human experience. At the same time, the anthropological and psychological study of mythology, exemplified by works like Frazer's The Golden Bough and later Jung's investigations into the collective unconscious, suggested that mythological thinking represented not primitive superstition but a fundamental mode of human consciousness. Joyce, educated in the Jesuit tradition with its emphasis on scholastic logic and systematic theology, yet deeply immersed in the symbolic richness of Irish folklore and Catholic ritual, was uniquely positioned to explore this tension.
+Ulysses stands as Joyce's most ambitious attempt to synthesize mythological and rational modes of understanding. The novel's famous parallel with Homer's Odyssey provides its mythological framework, yet this framework operates within a minutely realistic portrayal of Dublin on June 16, 1904. The precision with which Joyce documents the geography, social relations, and material culture of Dublin reflects a scientific attention to empirical detail that would satisfy the most demanding naturalist. Yet this realistic surface constantly opens onto mythological depths. Leopold Bloom's wanderings through Dublin simultaneously constitute a precise mapping of urban space and a reenactment of Odysseus's mythic journey. Stephen Dedalus's struggle with history and identity invokes both the philosophical reasoning of Aristotle and Aquinas and the mythological figure of Daedalus, the archetypal artist-craftsman. Molly Bloom's soliloquy draws on both the psychological realism of stream-of-consciousness technique and the mythological associations of Penelope and the eternal feminine.
+The influence of Giambattista Vico on Joyce's conception of myth and reason proves particularly significant. Vico's New Science, with its theory of historical cycles and its emphasis on the mythopoeic origins of human consciousness, provided Joyce with a model for understanding the relationship between mythological and rational thought that avoided simple opposition. For Vico, human history moves through recurring cycles of divine, heroic, and human ages, with each cycle ending in a ricorso that returns civilization to its mythological origins. This cyclical view of history, which Joyce adopts and adapts in both Ulysses and Finnegans Wake, suggests that mythology and reason are not opposed but rather represent different moments in an ongoing historical process. The mythological consciousness that characterizes the divine age does not disappear with the advent of rational thought but remains as a substratum of human experience, ready to resurface in moments of crisis or transformation.
+Joyce's engagement with Vico's thought appears throughout Ulysses in various forms. The novel's circular structure, ending with Molly's affirmation that returns us to the beginning of Bloom's day, reflects Vico's cyclical conception of history. The thunderwords that punctuate Finnegans Wake have their precedent in the thunder that, according to Vico, first inspired religious awe in primitive humanity. More subtly, Joyce's technique of layering contemporary Dublin life with mythological parallels embodies Vico's insight that all human institutions and practices carry within them the traces of their mythological origins. When Bloom enters the newspaper office, he enters not just a modern site of rational discourse but also the cave of the winds where Aeolus held court. When Stephen theorizes about Shakespeare in the library, he engages not just in literary criticism but in a form of mythmaking that seeks to understand artistic creation through narrative and symbol.
+The influence of Nietzsche adds another dimension to Joyce's treatment of myth and reason. Nietzsche's critique of scientific rationalism and his call for a revival of tragic, mythological consciousness resonated with Joyce's own skepticism about the claims of reason to provide complete understanding. The Apollonian-Dionysian distinction that Nietzsche develops in The Birth of Tragedy finds echoes in Joyce's portrayal of Stephen Dedalus and Leopold Bloom. Stephen, with his intellectual intensity and his commitment to artistic form, embodies certain Apollonian qualities, while Bloom, with his sensual immediacy and his emotional responsiveness, suggests Dionysian elements. Yet Joyce complicates this schema by showing how each character contains both principles. Stephen's artistic theories invoke mythological and mystical concepts that transcend rational analysis, while Bloom's practical intelligence and scientific curiosity demonstrate a commitment to rational understanding.
+Nietzsche's proclamation of the death of God and his vision of the eternal recurrence also inform Joyce's mythological method. The absence of traditional religious certainty in Ulysses creates a space where mythology can function not as literal truth but as a structuring principle for experience. The eternal recurrence, Nietzsche's mythological alternative to linear, progressive time, finds expression in Joyce's technique of repetition and variation. Phrases, images, and situations recur throughout Ulysses with modifications that suggest both sameness and difference, creating a temporal structure that combines the cyclical time of myth with the linear time of realistic narrative. This technique reaches its culmination in Finnegans Wake, where the principle of recurrence governs not just theme and structure but the very fabric of language itself.
+The relationship between mythology and science in Ulysses deserves particular attention. Joyce lived during a period of revolutionary scientific development, with Einstein's theory of relativity, Planck's quantum mechanics, and Freud's psychoanalysis all challenging conventional understandings of reality. Rather than seeing science as opposed to mythology, Joyce recognized that modern science itself was generating new mythologies. The notion of space-time, the uncertainty principle, and the unconscious all represented concepts that transcended ordinary rational comprehension and required imaginative, almost mythological modes of understanding. In Ulysses, scientific and mythological modes of thought interpenetrate. Bloom's interest in physics and astronomy coexists with his susceptibility to pseudoscientific theories and mystical speculations. Stephen's aesthetic theories draw on both Aristotelian logic and mystical correspondence. The novel's stream-of-consciousness technique itself represents an attempt to apply scientific precision to the representation of consciousness while acknowledging the mythological and symbolic dimensions of mental life.
+The logic that governs Joyce's narrative method similarly combines rational and mythological elements. The elaborate schemas that Joyce created for Ulysses, assigning to each episode specific organs, arts, colors, and symbols, suggest a systematic, almost scientific approach to literary construction. Yet these schemas also recall the elaborate correspondences of medieval and Renaissance cosmology, where rational system-building served mythological and spiritual purposes. The logic of Ulysses is neither purely deductive nor purely associative but combines both modes. The novel's elaborate network of cross-references, allusions, and leitmotifs creates a structure that can be analyzed rationally yet exceeds rational comprehension. Like the Celtic knots that Joyce knew from Irish manuscript tradition, the novel's patterns can be traced but never fully untangled.
+Modernism as a literary and artistic movement provided the context for Joyce's synthesis of myth and reason. The modernist project, as Joyce understood it, involved not a rejection of the past but a reconstruction of tradition under contemporary conditions. The mythological method that Eliot identified in Ulysses represented one strategy for this reconstruction. By using ancient myths as structuring devices for contemporary narratives, modernist writers could maintain continuity with tradition while acknowledging the fragmentation and discontinuity of modern experience. Yet Joyce's use of mythology differs from that of many of his modernist contemporaries. Where Eliot's use of myth in The Waste Land tends toward a conservative vision of cultural decline, Joyce's mythological parallels operate more playfully and democratically. Bloom as Odysseus is both comic and heroic, both a parody and a genuine embodiment of the mythic archetype.
+The scientific rationalism that modernism both embraced and questioned finds complex expression in Joyce's work. The experimental techniques of modernist literature—stream of consciousness, multiple perspectives, temporal dislocation—drew inspiration from scientific concepts of relativity and uncertainty. Yet these same techniques served to undermine the authority of scientific rationalism by showing the limitations of any single perspective or method. Joyce's encyclopedic ambition in Ulysses, his attempt to include all aspects of human experience within a single work, recalls the totalizing aspirations of nineteenth-century science. Yet the novel's polyphonic structure, its refusal of authoritative narration, and its openness to multiple interpretations resist scientific reduction. The novel presents itself as both a rational construction and an organic growth, both a logical system and a mythological cosmos.
+The treatment of Irish mythology and folklore in Joyce's work adds another layer to his negotiation between myth and reason. Ireland's rich mythological tradition, preserved in oral culture and revived by the Celtic Revival, offered Joyce an alternative to both British rationalism and Catholic orthodoxy. Yet Joyce's relationship to Irish mythology remained complex and often ironic. He recognized the political uses to which mythology could be put, its potential for both liberation and mystification. In Ulysses, references to Irish myth and legend appear alongside references to classical mythology, creating a syncretic mythological framework that resists nationalist appropriation. The citizen's bombastic invocation of Irish heroes in the Cyclops episode demonstrates how mythology can be deployed for narrow political purposes, while Bloom's more inclusive humanism suggests a different relationship to mythological tradition.
+The question of language in Joyce's work fundamentally involves the relationship between myth and reason. Language itself operates both rationally, through logical grammar and semantic meaning, and mythologically, through sound, rhythm, and association. Joyce's linguistic experiments, particularly in the later episodes of Ulysses and throughout Finnegans Wake, explore this double nature of language. The puns, portmanteaus, and multilingual wordplay that characterize Joyce's later style create meanings that cannot be reduced to logical paraphrase yet follow their own associative logic. Language becomes a space where the rational and the mythological intersect, where logical meaning and mythic resonance combine to create new possibilities for expression.
+The psychological dimension of Joyce's work reveals another aspect of his engagement with myth and reason. The stream-of-consciousness technique that Joyce pioneered attempts to represent consciousness with scientific accuracy, yet what it reveals is the fundamentally non-rational nature of mental life. The minds of Stephen, Bloom, and Molly move not through logical sequences but through associations, memories, and fantasies that follow emotional and symbolic rather than rational patterns. Yet Joyce presents these non-rational mental processes with a precision and clarity that satisfies the demands of realistic representation. The unconscious, which Freud was exploring through scientific method even as he discovered its mythological structures, becomes in Joyce's work a space where myth and reason converge.
+The ethical implications of Joyce's treatment of myth and reason deserve consideration. Both mythological thinking and rational analysis can serve to justify or challenge existing power structures. Joyce's work consistently exposes the ways in which both myth and reason can be manipulated for ideological purposes. The mythology of racial superiority that the citizen espouses in the Cyclops episode demonstrates the dangerous potential of mythological thinking, while the pseudo-rational arguments of anti-Semitism that appear throughout the novel show how reason can be perverted to serve prejudice. Yet Joyce also shows how both myth and reason can serve human understanding and compassion. Bloom's humanitarian rationalism and his imaginative sympathy represent complementary virtues, while Stephen's intellectual rigor and his artistic vision suggest another form of synthesis.
+The aesthetic theory that Stephen develops in A Portrait of the Artist as a Young Man and elaborates in Ulysses attempts to ground artistic creation in rational principles while acknowledging its mythological dimensions. Stephen's adaptation of Aquinas's aesthetic philosophy represents an attempt to establish a logical foundation for art, yet his actual artistic practice draws on mythological and symbolic modes of understanding. The tension between Stephen's theoretical rationalism and his imaginative practice reflects Joyce's own position as an artist working between mythological and rational modes. The epiphany, Joyce's term for moments of sudden spiritual manifestation, suggests an aesthetic that combines empirical observation with mythological revelation.
+The representation of sexuality in Ulysses particularly demonstrates Joyce's integration of mythological and rational perspectives. Sexuality appears in the novel both as a biological function subject to scientific analysis and as a mythological force connected to fertility, creativity, and cosmic energy. Bloom's sexual fantasies and Molly's erotic memories are presented with psychological realism, yet they also invoke mythological archetypes of desire and generation. The novel's frank treatment of bodily functions reflects a scientific materialism that refuses to idealize human nature, yet this materialism coexists with a mythological sense of the body as microcosm, containing within itself the patterns of the larger cosmos.
+The political dimensions of Joyce's work cannot be separated from his treatment of myth and reason. The colonial situation of Ireland exposed the ways in which both mythological narratives and rational arguments could serve imperial power. British colonialism justified itself through both the mythology of civilizing mission and the rational language of progress and development. Irish nationalism responded with its own mythologies and its own claims to reason. Joyce's work navigates between these positions, exposing the limitations of both while seeking a more complex understanding. Bloom's position as a Hungarian Jew of Irish nationality places him outside the conventional categories of both British rationalism and Irish mythology, allowing him to embody a different relationship to both traditions.
+The formal innovations of Ulysses themselves constitute a negotiation between mythological and rational principles. The novel's eighteen episodes each employ different literary techniques, creating a formal variety that resists systematic reduction. Yet this variety itself follows a logic, moving from the relatively conventional narrative of the early episodes through increasing complexity to the linguistic experimentation of the final chapters. This progression suggests both a rational development and a mythological journey, a logical exploration of literary possibilities and a symbolic movement through different states of consciousness. The novel's form thus embodies the synthesis of myth and reason that its content explores.
+The question of belief underlies Joyce's entire treatment of myth and reason. In a post-religious age, neither mythological tradition nor rational analysis can command absolute belief. Joyce's work acknowledges this crisis of belief while seeking new grounds for conviction. The "yes" that concludes Molly's soliloquy and Ulysses itself represents not rational assent or mythological faith but an affirmation that transcends both categories. This affirmation emerges from the full engagement with human experience in all its rational and non-rational dimensions. Joyce suggests that meaning emerges not from choosing between myth and reason but from embracing both as necessary dimensions of human understanding.
+The legacy of Joyce's negotiation between myth and reason extends throughout twentieth and twenty-first century literature. His demonstration that mythological and rational modes need not be opposed but can be integrated within a single artistic vision opened new possibilities for literary expression. Writers as diverse as Beckett, Rushdie, and Morrison have drawn on Joyce's example in creating works that combine mythological resonance with rational analysis. The postmodern recognition that reason itself operates within mythological frameworks, that science generates its own myths, and that mythology contains its own logic, finds precedent in Joyce's work.
+In conclusion, Joyce's treatment of myth and reason in Ulysses and his other works represents neither a simple opposition nor a facile synthesis but a complex negotiation that acknowledges the claims of both while transcending the limitations of each. Through his engagement with Vico's cyclical history and Nietzsche's critique of rationalism, through his modernist experimentation and his rootedness in Irish tradition, through his scientific precision and his mythological imagination, Joyce creates a literary space where multiple modes of understanding can coexist and illuminate each other. His work suggests that the choice between myth and reason represents a false dichotomy, that human experience requires both the logical rigor of rational analysis and the symbolic richness of mythological imagination. In an age that continues to struggle with the competing claims of scientific materialism and spiritual meaning, Joyce's example remains relevant, showing how literature can hold in productive tension the different ways humans make sense of their experience. The achievement of Ulysses lies not in resolving the tension between myth and reason but in demonstrating how that tension itself can become a source of artistic energy and human insight.
+
+"""
+
+def main():
+    parser = argparse.ArgumentParser(description="LRC Text Differentiator — Proof of Concept")
+    parser.add_argument("--text1", type=str, help="Path to first text file (optional)")
+    parser.add_argument("--text2", type=str, help="Path to second text file (optional)")
+    parser.add_argument("--target", type=str, default=TARGET_WORD_DEFAULT, help="Target word for word_presence encoding")
+    parser.add_argument("--min-rs", type=int, default=MIN_RS_POINTS, help="Minimum series length to use RS Hurst")
+    args = parser.parse_args()
+
+    # Load texts
+    def load(p, default):
+        if p:
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+        return default
+
+    t1 = load(args.text1, HUMAN_TEXT)
+    t2 = load(args.text2, GPT_TEXT)
+
+    if t1 and t2:
+        compare_texts(t1, t2, target_word=args.target, min_rs_points=args.min_rs)
+    elif t1 and not t2:
+        res = analyze_text(t1, target_word=args.target, min_rs_points=args.min_rs)
+        print("\n=== Single Text Analysis ===")
+        for name, (val, method) in res.encoding_values.items():
+            print(f"{name:18s}: {val:.3f}  [{method}]")
+        print(f"Aggregate (mean): {res.aggregate_score:.3f}")
+        print(f"Verdict: {res.verdict}")
+    else:
+        # default: run built-in comparison
+        compare_texts(HUMAN_TEXT, GPT_TEXT, target_word=args.target, min_rs_points=args.min_rs)
+
+if __name__ == "__main__":
+    main()
+
